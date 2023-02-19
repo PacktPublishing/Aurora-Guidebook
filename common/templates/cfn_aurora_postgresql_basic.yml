@@ -1,0 +1,766 @@
+---
+## Basic Aurora PostgreSQL Regional DB Cluster Deployment
+## This template deploys a basic Amazon Aurora PostgreSQL DB cluster with Serverless (v2) 
+## DB instances into a dedicated VPC, with most best practice configurations.
+##
+## This template creates the following resources in an AWS account:
+## - VPC with Internet Gateway and 2 routing tables
+## - 3 public and 3 private subnets
+## - NAT Gateway and associated routing rules for private subnets (incurs costs)
+## - S3 bucket and gateway VPC endpoint for S3 export/import use cases (incurs costs when used)
+## - DB subnet group
+## - 2 security groups (one for the client the other for the database) with appropriate rules
+## - AWS Secrets Manager secret, storing DB cluster master user credentials (incurs costs)
+## - AWS IAM roles for enhanced monitoring, service integration and the client host
+## - Amazon EC2 instance used as the client host (incurs costs)
+## - AWS Systems Manager command document to bootstrap client host
+## - Custom DB cluster parameter group
+## - Aurora PostgreSQL DB cluster (incurs storage and backup costs)
+## - Between 1 and 6 Aurora PostgreSQL DB instances depending on selection (incurs costs)
+## - Optionally, an Amazon Aurora global cluster resource
+##
+## Dependencies:
+## none
+##
+## License:
+## This sample code is made available under the MIT-0 license. See the LICENSE file.
+
+AWSTemplateFormatVersion: 2010-09-09
+Description: Basic Aurora PostgreSQL Regional DB Cluster Deployment
+
+
+## Parameters
+Parameters:
+  DeployNumberReaders:
+    Default: 1
+    Type: Number
+    MaxValue: 5
+    MinValue: 0
+    Description: Number of reader DB instances to deploy (read replicas)
+  DeployGlobalCluster:
+    Default: "No"
+    Type: String
+    AllowedValues:
+      - "Yes"
+      - "No"
+    Description: Whether to deploy the global cluster resource (primary region) and this cluster as primary
+  DeployClientInstanceType:
+    Default: "t4g.large"
+    Type: String
+    Description: The EC2 instance type to use for the workstation/bastion host
+  DeployDbInstanceClass:
+    Default: "db.serverless"
+    Type: String
+    Description: The DB instance class to use for the Aurora cluster DB instances
+  DeployLatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-ebs'
+    Description: Please leave as-is, reserved for internal use.
+  DeployBackupRetention:
+    Default: 1
+    Type: Number
+    MaxValue: 35
+    MinValue: 1
+    Description: Number of days to retain automated backups for point-in-time restore
+
+
+## Conditions
+Conditions:
+  condDeployReader1: !Not [ !Equals [ !Ref DeployNumberReaders, 0 ] ]
+  condDeployReader2: !Not [ !Or [ !Equals [ !Ref DeployNumberReaders, 0 ], !Equals [ !Ref DeployNumberReaders, 1 ] ] ]
+  condDeployReader3: !Not [ !Or [ !Equals [ !Ref DeployNumberReaders, 0 ], !Equals [ !Ref DeployNumberReaders, 1 ], !Equals [ !Ref DeployNumberReaders, 2 ] ] ]
+  condDeployReader4: !Not [ !Or [ !Equals [ !Ref DeployNumberReaders, 0 ], !Equals [ !Ref DeployNumberReaders, 1 ], !Equals [ !Ref DeployNumberReaders, 2 ], !Equals [ !Ref DeployNumberReaders, 3 ] ] ]
+  condDeployReader5: !Equals [ !Ref DeployNumberReaders, 5 ]
+  condDeployGlobalCluster: !Equals [ !Ref DeployGlobalCluster, "Yes" ]
+
+
+## Mappings
+Mappings:
+  NetworkSettings:
+    primary:
+      vpcCidr: 172.32.0.0/16
+      subPub1Cidr: 172.32.0.0/24
+      subPub2Cidr: 172.32.1.0/24
+      subPub3Cidr: 172.32.2.0/24
+      subPrv1Cidr: 172.32.10.0/24
+      subPrv2Cidr: 172.32.11.0/24
+      subPrv3Cidr: 172.32.12.0/24
+  ClusterSettings:
+    global:
+      dbSchema: example
+      dbDriver: pgsql
+      dbEngine: aurora-postgresql
+      dbFamily: aurora-postgresql14
+      dbVersion: "14.6"
+
+
+## Resources
+Resources:
+
+  ## VPC
+  vpc:
+    Type: "AWS::EC2::VPC"
+    Properties:
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      InstanceTenancy: default
+      CidrBlock: !FindInMap [ NetworkSettings, primary, vpcCidr ]
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-vpc"
+
+## Create an IGW & attach it to the VPC
+  vpcIgw:
+    Type: "AWS::EC2::InternetGateway"
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-igw"
+  attachIgwVpc:
+    Type: "AWS::EC2::VPCGatewayAttachment"
+    Properties:
+      VpcId: !Ref vpc
+      InternetGatewayId: !Ref vpcIgw
+
+  ## Create a public and private subnet in each of 3 AZs in the region
+  sub1Private:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      VpcId: !Ref vpc
+      CidrBlock: !FindInMap [ NetworkSettings, primary, subPrv1Cidr ]
+      AvailabilityZone: !Select 
+                        - 0
+                        - Fn::GetAZs: !Ref 'AWS::Region'
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-private-1"
+  sub1Public:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      VpcId: !Ref vpc
+      CidrBlock: !FindInMap [ NetworkSettings, primary, subPub1Cidr ]
+      AvailabilityZone: !Select 
+                        - 0
+                        - Fn::GetAZs: !Ref 'AWS::Region'
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-public-1"
+  sub2Private:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      VpcId: !Ref vpc
+      CidrBlock: !FindInMap [ NetworkSettings, primary, subPrv2Cidr ]
+      AvailabilityZone: !Select 
+                        - 1
+                        - Fn::GetAZs: !Ref 'AWS::Region'
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-private-2"
+  sub2Public:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      VpcId: !Ref vpc
+      CidrBlock: !FindInMap [ NetworkSettings, primary, subPub2Cidr ]
+      AvailabilityZone: !Select 
+                        - 1
+                        - Fn::GetAZs: !Ref 'AWS::Region'
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-public-2"
+  sub3Private:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      VpcId: !Ref vpc
+      CidrBlock: !FindInMap [ NetworkSettings, primary, subPrv3Cidr ]
+      AvailabilityZone: !Select 
+                        - 2
+                        - Fn::GetAZs: !Ref 'AWS::Region'
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-private-3"
+  sub3Public:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      VpcId: !Ref vpc
+      CidrBlock: !FindInMap [ NetworkSettings, primary, subPub3Cidr ]
+      AvailabilityZone: !Select 
+                        - 2
+                        - Fn::GetAZs: !Ref 'AWS::Region'
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-public-3"
+
+## Create a NAT Gateway & EIP
+  natEip:
+    Type: "AWS::EC2::EIP"
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-nat-ip"
+  vpcNgw:
+    Type: "AWS::EC2::NatGateway"
+    DependsOn: attachIgwVpc
+    Properties:
+      AllocationId: !GetAtt natEip.AllocationId
+      SubnetId: !Ref sub2Public
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-nat-ip"
+
+## Associate the public subnets with a public route table
+  rtbPublic:
+    Type: "AWS::EC2::RouteTable"
+    Properties:
+      VpcId: !Ref vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-public"
+  rteToIgw:
+    Type: "AWS::EC2::Route"
+    DependsOn: attachIgwVpc
+    Properties:
+      RouteTableId: !Ref rtbPublic
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId: !Ref vpcIgw
+  srta1Public:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      SubnetId: !Ref sub1Public
+      RouteTableId: !Ref rtbPublic
+  srta2Public:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      SubnetId: !Ref sub2Public
+      RouteTableId: !Ref rtbPublic
+  srta3Public:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      SubnetId: !Ref sub3Public
+      RouteTableId: !Ref rtbPublic
+
+## Associate the private subnets with a nat-ed route in the private route table
+  rtbPrivate:
+    Type: "AWS::EC2::RouteTable"
+    Properties:
+      VpcId: !Ref vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-private"
+  rteToNgw:
+    Type: "AWS::EC2::Route"
+    Properties:
+      RouteTableId: !Ref rtbPrivate
+      DestinationCidrBlock: "0.0.0.0/0"
+      NatGatewayId: !Ref vpcNgw
+  srta1Private:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref sub1Private
+      RouteTableId: !Ref rtbPrivate
+  srta2Private:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref sub2Private
+      RouteTableId: !Ref rtbPrivate
+  srta3Private:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref sub3Private
+      RouteTableId: !Ref rtbPrivate
+
+  ## S3 bucket to host data
+  s3Data:
+    Type: 'AWS::S3::Bucket'
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-data-examples'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+            Status: Enabled
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-data-examples'
+
+  ## Create VPC S3 endpoint
+  s3Enpoint:
+    Type: "AWS::EC2::VPCEndpoint"
+    Properties:
+      VpcId: !Ref vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      RouteTableIds:
+        - !Ref rtbPrivate
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Principal: "*"
+            Effect: Allow
+            Action: "s3:*"
+            Resource:
+              - "arn:aws:s3:::*"
+              - "arn:aws:s3:::*/*"
+
+## Create DB subnet group
+  dbSubnets:
+    Type: "AWS::RDS::DBSubnetGroup"
+    Properties:
+      DBSubnetGroupName: !Sub "${AWS::StackName}-db-subnets"
+      DBSubnetGroupDescription: "Indicates the subnets where DB cluster instances can be deployed"
+      SubnetIds: [ !Ref sub1Private, !Ref sub2Private, !Ref sub3Private ]
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-db-subnets"
+
+## Create client security group
+  clientSecGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      VpcId: !Ref vpc
+      GroupName: !Sub "${AWS::StackName}-clients"
+      GroupDescription: "Security group (firewall) for clients to use when connecting to the database"
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-clients"
+
+## Create DB security group
+  dbClusterSecGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      VpcId: !Ref vpc
+      GroupName: !Sub "${AWS::StackName}-databases"
+      GroupDescription: "Security group (firewall) for databases to use"
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-databases"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref clientSecGroup
+          Description: "Allows PostgreSQL access from the clients security group"
+  ruleDbClusterSecGroupIngressSelf:
+    Type: "AWS::EC2::SecurityGroupIngress"
+    Properties:
+      GroupId: !Ref dbClusterSecGroup
+      IpProtocol: -1
+      Description: "Allows all inbound access from sources with the same security group"
+      SourceSecurityGroupId: !Ref dbClusterSecGroup
+
+## Create a random generated password and store it as a secret for the DB cluster
+  secretClusterAdminUser:
+    Type: "AWS::SecretsManager::Secret"
+    Properties:
+      Description: !Sub "Administrator user credentials for DB cluster '${AWS::StackName}-psql-primary'"
+      Name: !Sub "${AWS::StackName}-administrator"
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "administrator"}'
+        GenerateStringKey: 'password'
+        PasswordLength: 10
+        ExcludeCharacters: ="@/\\$`&:{}()[]'
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-administrator"
+
+## Create enhanced monitoring role
+  roleEnhancedMonitoring:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-database-em"
+      Description: "Allows your Aurora DB cluster to deliver Enhanced Monitoring metrics."
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - "sts:AssumeRole"
+            Principal:
+              Service:
+                - "monitoring.rds.amazonaws.com"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole"
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-database-em"
+
+## Create external integration role
+  roleServiceIntegration:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-database-integration"
+      Description: "Allows your Aurora DB cluster to integrate with other AWS services, such as Amazon S3 for import/export."
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - "sts:AssumeRole"
+            Principal:
+              Service:
+                - "rds.amazonaws.com"
+      Policies:
+        - PolicyName: inline-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:PutObject"
+                  - "s3:GetObject"
+                  - "s3:AbortMultipartUpload"
+                  - "s3:ListBucket"
+                  - "s3:DeleteObject"
+                  - "s3:GetObjectVersion"
+                  - "s3:ListMultipartUploadParts"
+                Resource:
+                  - !Sub "arn:aws:s3:::${s3Data}/*"
+                  - !Sub "arn:aws:s3:::${s3Data}"
+              - Effect: Allow
+                Action:
+                  - "lambda:InvokeFunction"
+                Resource:
+                  - "*"
+              - Effect: Allow
+                Action:
+                  - "logs:GetLogEvents"
+                  - "logs:PutLogEvents"
+                Resource:
+                  - "arn:aws:logs:*:*:log-group:/aws/rds/*:log-stream:*"
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogStream"
+                  - "logs:DescribeLogStreams"
+                  - "logs:PutRetentionPolicy"
+                  - "logs:CreateLogGroup"
+                Resource:
+                  - "arn:aws:logs:*:*:log-group:/aws/rds/*"
+              - Effect: Allow
+                Action:
+                  - "comprehend:DetectSentiment"
+                  - "comprehend:BatchDetectSentiment"
+                  - "sagemaker:InvokeEndpoint"
+                Resource:
+                  - "*"
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-database-integration"
+
+## Create role for client IDE
+  roleClientHost:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-client-host"
+      Description: "Permits user interaction with AWS APIs from the client hosts."
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - "sts:AssumeRole"
+            Principal:
+              Service:
+                - "ec2.amazonaws.com"
+                - "ssm.amazonaws.com"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+        - "arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess"
+      Policies:
+        - PolicyName: inline-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "rds:*"
+                  - "rds-db:connect"
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - "secretsmanager:GetSecretValue"
+                Resource:
+                  - !Ref secretClusterAdminUser
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-client-host"
+  profileClientHost:
+    Type: "AWS::IAM::InstanceProfile"
+    Properties:
+      InstanceProfileName: !Sub "${AWS::StackName}-client-host"
+      Path: /
+      Roles:
+        - Ref: roleClientHost
+
+## Create the client (no inbound internet access, use Session Manager to connect)
+  ec2ClientHost:
+    Type: "AWS::EC2::Instance"
+    Properties:
+      SubnetId: !Ref sub2Private
+      InstanceType: !Ref DeployClientInstanceType
+      SecurityGroupIds: [ !Ref clientSecGroup ]
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-client-host"
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            DeleteOnTermination: true
+            VolumeSize: 32
+            VolumeType: gp3
+      ImageId: !Ref DeployLatestAmiId
+      IamInstanceProfile: !Ref profileClientHost
+
+## Create a Cloud9 host SSM bootstrap document
+  ssmDocClientBootstrap: 
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Command
+      Name: !Sub "${AWS::StackName}-bootstrap-client"
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-bootstrap-client"
+      Content:
+        schemaVersion: '2.2'
+        description: "Bootstrap Client Host Instances"
+        mainSteps:
+        - action: aws:runShellScript
+          name: BootstrapTools
+          inputs:
+            runCommand:
+            - "#!/bin/bash -xe"
+            - "echo \"$(date \"+%F %T\") * running as $(whoami)\" >> /bootstrap.log"
+            - "yum install -y unzip jq git gcc python3-devel"
+            - "sudo pip3 uninstall awscli -y"
+            - "sudo rm -r /usr/bin/aws -f"
+            - "echo \"$(date \"+%F %T\") * installed supporting packages\" >> /bootstrap.log"
+            - "mkdir /home/ec2-user/awscli"
+            - "curl \"https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip\" -o \"/home/ec2-user/awscli/awscliv2.zip\""
+            - "unzip \"/home/ec2-user/awscli/awscliv2.zip\" -d \"/home/ec2-user/awscli\""
+            - "sudo chown ec2-user:ec2-user /home/ec2-user/awscli/aws -R"
+            - "sudo /home/ec2-user/awscli/aws/install -i /usr/local/aws-cli -b /usr/local/bin"
+            - "echo \"$(date \"+%F %T\") * installed awscli (v2)\" >> /bootstrap.log"
+            - "yum remove -y mariadb"
+            - "amazon-linux-extras enable postgresql13"
+            - "yum clean metadata && sudo yum install -y postgresql-contrib postgresql postgresql-devel libpq-devel sysbench"
+            - "echo \"$(date \"+%F %T\") * installed postgresql client libraries\" >> /bootstrap.log"
+            - "mkdir -p /home/ec2-user/.aws"
+            - "touch /home/ec2-user/.aws/config"
+            - "echo \"[default]\" >> /home/ec2-user/.aws/config"
+            - !Sub "echo \"region = ${AWS::Region}\" >> /home/ec2-user/.aws/config"
+            - "chown -R ec2-user:ec2-user /home/ec2-user/.aws"
+            - "aws --version >> /bootstrap.log"
+            - "echo \"$(date \"+%F %T\") * configured aws cli\" >> /bootstrap.log"
+            - !Sub 'export DBWRITER="${dbCluster.Endpoint.Address}" && echo "export DBWRITER=\"$DBWRITER\"" >> /home/ec2-user/.bashrc'
+            - !Sub 'export DBREADER="${dbCluster.ReadEndpoint.Address}" && echo "export DBREADER=\"$DBREADER\"" >> /home/ec2-user/.bashrc'
+            - "echo \"$(date \"+%F %T\") * environment vars initialized\" >> /bootstrap.log"
+            - !Sub "export SECRETSTRING=`aws secretsmanager get-secret-value --secret-id \"${secretClusterAdminUser}\" --region ${AWS::Region} | jq -r '.SecretString'` && export DBPASS=`echo $SECRETSTRING | jq -r '.password'` && export DBUSER=`echo $SECRETSTRING | jq -r '.username'`"
+            - 'echo "export DBPASS=\"$DBPASS\"" >> /home/ec2-user/.bashrc && echo "export DBUSER=$DBUSER" >> /home/ec2-user/.bashrc'
+            - "echo \"$(date \"+%F %T\") * db credentials initialized\" >> /bootstrap.log"
+            - "chown -R ec2-user:ec2-user /home/ec2-user/environment"
+            - "echo \"$(date \"+%F %T\") * updated file ownership\" >> /bootstrap.log"
+            - "echo \"$(date \"+%F %T\") * bootstrap complete, rebooting\" >> /bootstrap.log"
+            - "shutdown -r now"
+
+## Create cluster parameter group
+  cpgClusterParams:
+    Type: "AWS::RDS::DBClusterParameterGroup"
+    Properties:
+      Description: !Sub "${AWS::StackName}-psql-cluster-params"
+      Family: !FindInMap [ ClusterSettings, global, dbFamily ]
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-psql-cluster-params"
+
+## Create Aurora cluster
+  dbCluster:
+    Type: "AWS::RDS::DBCluster"
+    DeletionPolicy: Delete
+    Properties:
+      Engine: !FindInMap [ ClusterSettings, global, dbEngine ]
+      EngineVersion: !FindInMap [ ClusterSettings, global, dbVersion ]
+      DBSubnetGroupName: !Ref dbSubnets
+      DBClusterParameterGroupName: !Ref cpgClusterParams
+      DBClusterIdentifier: !Sub "${AWS::StackName}-psql-primary"
+      BackupRetentionPeriod: !Ref DeployBackupRetention
+      MasterUsername: !Join ["", ["{{resolve:secretsmanager:", !Ref secretClusterAdminUser, ":SecretString:username}}" ]]
+      MasterUserPassword: !Join ["", ["{{resolve:secretsmanager:", !Ref secretClusterAdminUser, ":SecretString:password}}" ]]
+      DatabaseName: !FindInMap [ ClusterSettings, global, dbSchema ]
+      StorageEncrypted: true
+      VpcSecurityGroupIds: [ !Ref dbClusterSecGroup ]
+      EnableCloudwatchLogsExports: [ error, slowquery ]
+      EnableIAMDatabaseAuthentication: true
+      ServerlessV2ScalingConfiguration:
+        MaxCapacity: 128
+        MinCapacity: 0.5
+      AssociatedRoles:
+        - RoleArn: !GetAtt roleServiceIntegration.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-psql-primary"
+
+## Deploy global cluster only if we are not in a secondary region and we were indicated to do so
+  globalCluster:
+    Type: "AWS::RDS::GlobalCluster"
+    Condition: condDeployGlobalCluster
+    Properties:
+      GlobalClusterIdentifier: !Sub "${AWS::StackName}-psql-global"
+      SourceDBClusterIdentifier: !Ref dbCluster
+
+## Deploy cluster node #1
+  dbNode1:
+    Type: "AWS::RDS::DBInstance"
+    Properties:
+      DBClusterIdentifier: !Ref dbCluster
+      DBInstanceIdentifier: !Sub "${AWS::StackName}-psql-node-1"
+      CopyTagsToSnapshot: true
+      DBInstanceClass: !Ref DeployDbInstanceClass
+      Engine: !FindInMap [ ClusterSettings, global, dbEngine ]
+      MonitoringInterval: 1
+      MonitoringRoleArn: !GetAtt roleEnhancedMonitoring.Arn
+      PubliclyAccessible: false
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: 7
+      PromotionTier: 0
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-psql-node-1"
+
+## Deploy cluster node #2
+  dbNode2:
+    Type: "AWS::RDS::DBInstance"
+    DependsOn: [ dbNode1 ]
+    Condition: condDeployReader1
+    Properties:
+      DBClusterIdentifier: !Ref dbCluster
+      DBInstanceIdentifier: !Sub "${AWS::StackName}-psql-node-2"
+      CopyTagsToSnapshot: true
+      DBInstanceClass: !Ref DeployDbInstanceClass
+      Engine: !FindInMap [ ClusterSettings, global, dbEngine ]
+      MonitoringInterval: 1
+      MonitoringRoleArn: !GetAtt roleEnhancedMonitoring.Arn
+      PubliclyAccessible: false
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: 7
+      PromotionTier: 1
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-psql-node-2"
+
+## Deploy cluster node #3
+  dbNode3:
+    Type: "AWS::RDS::DBInstance"
+    DependsOn: [ dbNode1 ]
+    Condition: condDeployReader2
+    Properties:
+      DBClusterIdentifier: !Ref dbCluster
+      DBInstanceIdentifier: !Sub "${AWS::StackName}-psql-node-3"
+      CopyTagsToSnapshot: true
+      DBInstanceClass: !Ref DeployDbInstanceClass
+      Engine: !FindInMap [ ClusterSettings, global, dbEngine ]
+      MonitoringInterval: 1
+      MonitoringRoleArn: !GetAtt roleEnhancedMonitoring.Arn
+      PubliclyAccessible: false
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: 7
+      PromotionTier: 2
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-psql-node-3"
+
+## Deploy cluster node #4
+  dbNode4:
+    Type: "AWS::RDS::DBInstance"
+    DependsOn: [ dbNode1 ]
+    Condition: condDeployReader3
+    Properties:
+      DBClusterIdentifier: !Ref dbCluster
+      DBInstanceIdentifier: !Sub "${AWS::StackName}-psql-node-4"
+      CopyTagsToSnapshot: true
+      DBInstanceClass: !Ref DeployDbInstanceClass
+      Engine: !FindInMap [ ClusterSettings, global, dbEngine ]
+      MonitoringInterval: 1
+      MonitoringRoleArn: !GetAtt roleEnhancedMonitoring.Arn
+      PubliclyAccessible: false
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: 7
+      PromotionTier: 3
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-psql-node-4"
+
+## Deploy cluster node #5
+  dbNode5:
+    Type: "AWS::RDS::DBInstance"
+    DependsOn: [ dbNode1 ]
+    Condition: condDeployReader4
+    Properties:
+      DBClusterIdentifier: !Ref dbCluster
+      DBInstanceIdentifier: !Sub "${AWS::StackName}-psql-node-5"
+      CopyTagsToSnapshot: true
+      DBInstanceClass: !Ref DeployDbInstanceClass
+      Engine: !FindInMap [ ClusterSettings, global, dbEngine ]
+      MonitoringInterval: 1
+      MonitoringRoleArn: !GetAtt roleEnhancedMonitoring.Arn
+      PubliclyAccessible: false
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: 7
+      PromotionTier: 4
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-psql-node-5"
+
+## Deploy cluster node #6
+  dbNode6:
+    Type: "AWS::RDS::DBInstance"
+    DependsOn: [ dbNode1 ]
+    Condition: condDeployReader5
+    Properties:
+      DBClusterIdentifier: !Ref dbCluster
+      DBInstanceIdentifier: !Sub "${AWS::StackName}-psql-node-6"
+      CopyTagsToSnapshot: true
+      DBInstanceClass: !Ref DeployDbInstanceClass
+      Engine: !FindInMap [ ClusterSettings, global, dbEngine ]
+      MonitoringInterval: 1
+      MonitoringRoleArn: !GetAtt roleEnhancedMonitoring.Arn
+      PubliclyAccessible: false
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: 7
+      PromotionTier: 5
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-psql-node-6"
+
+## Outputs
+Outputs:
+  vpcId:
+    Description: "Aurora Lab VPC"
+    Value: !Ref vpc
+  clusterName:
+    Description: "Aurora Cluster Name"
+    Value: !Ref dbCluster
+  clusterEndpoint:
+    Description: "Aurora Cluster Endpoint"
+    Value: !GetAtt dbCluster.Endpoint.Address
+  readerEndpoint:
+    Description: "Aurora Reader Endpoint"
+    Value: !GetAtt dbCluster.ReadEndpoint.Address
+  dbSubnetGroup:
+    Description: "Database Subnet Group"
+    Value: !Ref dbSubnets
+  dbSecurityGroup:
+    Description: "Database Security Group"
+    Value: !Ref dbClusterSecGroup
+  secretArn:
+    Description: "Database Credentials Secret ARN"
+    Value: !Ref secretClusterAdminUser
