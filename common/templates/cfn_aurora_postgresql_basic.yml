@@ -54,8 +54,22 @@ Parameters:
     Description: The DB instance class to use for the Aurora cluster DB instances
   DeployLatestAmiId:
     Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
-    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-ebs'
-    Description: Please leave as-is, reserved for internal use.
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-arm64-gp2'
+    Description: Plese update accordingly to reflect the CPU architecture of the client instance type selected.
+  DeployArch:
+    Type: String
+    Default: arm64
+    Description: Plese update accordingly to reflect the CPU architecture of the client instance type selected.
+    AllowedValues:
+      - arm64
+      - x86_64
+  DeployClientTools:
+    Default: "Yes"
+    Type: String
+    Description: Should this stack also deploy an EC2 instance (and associated resources) for you to use to connect to the cluster?
+    AllowedValues:
+      - "Yes"
+      - "No"
   DeployBackupRetention:
     Default: 1
     Type: Number
@@ -72,6 +86,7 @@ Conditions:
   condDeployReader4: !Not [ !Or [ !Equals [ !Ref DeployNumberReaders, 0 ], !Equals [ !Ref DeployNumberReaders, 1 ], !Equals [ !Ref DeployNumberReaders, 2 ], !Equals [ !Ref DeployNumberReaders, 3 ] ] ]
   condDeployReader5: !Equals [ !Ref DeployNumberReaders, 5 ]
   condDeployGlobalCluster: !Equals [ !Ref DeployGlobalCluster, "Yes" ]
+  condDeployClientTools: !Equals [ !Ref DeployClientTools, "Yes" ]
 
 
 ## Mappings
@@ -278,8 +293,6 @@ Resources:
   ## S3 bucket to host data
   s3Data:
     Type: 'AWS::S3::Bucket'
-    DeletionPolicy: Retain
-    UpdateReplacePolicy: Retain
     Properties:
       BucketName: !Sub '${AWS::StackName}-data-examples'
       BucketEncryption:
@@ -460,6 +473,7 @@ Resources:
 ## Create role for client IDE
   roleClientHost:
     Type: "AWS::IAM::Role"
+    Condition: condDeployClientTools
     Properties:
       RoleName: !Sub "${AWS::StackName}-client-host"
       Description: "Permits user interaction with AWS APIs from the client hosts."
@@ -496,6 +510,7 @@ Resources:
           Value: !Sub "${AWS::StackName}-client-host"
   profileClientHost:
     Type: "AWS::IAM::InstanceProfile"
+    Condition: condDeployClientTools
     Properties:
       InstanceProfileName: !Sub "${AWS::StackName}-client-host"
       Path: /
@@ -505,6 +520,7 @@ Resources:
 ## Create the client (no inbound internet access, use Session Manager to connect)
   ec2ClientHost:
     Type: "AWS::EC2::Instance"
+    Condition: condDeployClientTools
     Properties:
       SubnetId: !Ref sub2Private
       InstanceType: !Ref DeployClientInstanceType
@@ -520,40 +536,16 @@ Resources:
             VolumeType: gp3
       ImageId: !Ref DeployLatestAmiId
       IamInstanceProfile: !Ref profileClientHost
-
-## Create a Cloud9 host SSM bootstrap document
-  ssmDocClientBootstrap: 
-    Type: AWS::SSM::Document
-    Properties:
-      DocumentType: Command
-      Name: !Sub "${AWS::StackName}-bootstrap-client"
-      Tags:
-        - Key: Name
-          Value: !Sub "${AWS::StackName}-bootstrap-client"
-      Content:
-        schemaVersion: '2.2'
-        description: "Bootstrap Client Host Instances"
-        mainSteps:
-        - action: aws:runShellScript
-          name: BootstrapTools
-          inputs:
-            runCommand:
-            - "#!/bin/bash -xe"
+      UserData: !Base64
+        "Fn::Join":
+          - "\n" 
+          - - "#!/bin/bash -xe"
             - "echo \"$(date \"+%F %T\") * running as $(whoami)\" >> /bootstrap.log"
-            - "yum install -y unzip jq git gcc python3-devel"
-            - "sudo pip3 uninstall awscli -y"
-            - "sudo rm -r /usr/bin/aws -f"
-            - "echo \"$(date \"+%F %T\") * installed supporting packages\" >> /bootstrap.log"
-            - "mkdir /home/ec2-user/awscli"
-            - "curl \"https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip\" -o \"/home/ec2-user/awscli/awscliv2.zip\""
-            - "unzip \"/home/ec2-user/awscli/awscliv2.zip\" -d \"/home/ec2-user/awscli\""
-            - "sudo chown ec2-user:ec2-user /home/ec2-user/awscli/aws -R"
-            - "sudo /home/ec2-user/awscli/aws/install -i /usr/local/aws-cli -b /usr/local/bin"
-            - "echo \"$(date \"+%F %T\") * installed awscli (v2)\" >> /bootstrap.log"
             - "yum remove -y mariadb"
-            - "amazon-linux-extras enable postgresql13"
-            - "yum clean metadata && sudo yum install -y postgresql-contrib postgresql postgresql-devel libpq-devel sysbench"
-            - "echo \"$(date \"+%F %T\") * installed postgresql client libraries\" >> /bootstrap.log"
+            - "yum install -y unzip jq git"
+            - "echo \"$(date \"+%F %T\") * installed supporting packages\" >> /bootstrap.log"
+            - "amazon-linux-extras install -y postgresql14"
+            - "echo \"$(date \"+%F %T\") * installed postgresql\" >> /bootstrap.log"
             - "mkdir -p /home/ec2-user/.aws"
             - "touch /home/ec2-user/.aws/config"
             - "echo \"[default]\" >> /home/ec2-user/.aws/config"
@@ -567,8 +559,6 @@ Resources:
             - !Sub "export SECRETSTRING=`aws secretsmanager get-secret-value --secret-id \"${secretClusterAdminUser}\" --region ${AWS::Region} | jq -r '.SecretString'` && export DBPASS=`echo $SECRETSTRING | jq -r '.password'` && export DBUSER=`echo $SECRETSTRING | jq -r '.username'`"
             - 'echo "export DBPASS=\"$DBPASS\"" >> /home/ec2-user/.bashrc && echo "export DBUSER=$DBUSER" >> /home/ec2-user/.bashrc'
             - "echo \"$(date \"+%F %T\") * db credentials initialized\" >> /bootstrap.log"
-            - "chown -R ec2-user:ec2-user /home/ec2-user/environment"
-            - "echo \"$(date \"+%F %T\") * updated file ownership\" >> /bootstrap.log"
             - "echo \"$(date \"+%F %T\") * bootstrap complete, rebooting\" >> /bootstrap.log"
             - "shutdown -r now"
 
@@ -578,6 +568,11 @@ Resources:
     Properties:
       Description: !Sub "${AWS::StackName}-psql-cluster-params"
       Family: !FindInMap [ ClusterSettings, global, dbFamily ]
+      Parameters:
+        log_rotation_age: '1440'
+        log_rotation_size: '102400'
+        rds.force_ssl: 0
+        shared_preload_libraries: 'pg_stat_statements,pg_hint_plan,auto_explain'
       Tags:
         - Key: Name
           Value: !Sub "${AWS::StackName}-psql-cluster-params"
@@ -598,13 +593,11 @@ Resources:
       DatabaseName: !FindInMap [ ClusterSettings, global, dbSchema ]
       StorageEncrypted: true
       VpcSecurityGroupIds: [ !Ref dbClusterSecGroup ]
-      EnableCloudwatchLogsExports: [ error, slowquery ]
+      EnableCloudwatchLogsExports: [ postgresql ]
       EnableIAMDatabaseAuthentication: true
       ServerlessV2ScalingConfiguration:
         MaxCapacity: 128
         MinCapacity: 0.5
-      AssociatedRoles:
-        - RoleArn: !GetAtt roleServiceIntegration.Arn
       Tags:
         - Key: Name
           Value: !Sub "${AWS::StackName}-psql-primary"
@@ -764,3 +757,6 @@ Outputs:
   secretArn:
     Description: "Database Credentials Secret ARN"
     Value: !Ref secretClusterAdminUser
+  sessionManagerUrl:
+    Description: "AWS Systems Manager Session Manager URL to use to connect to the client EC2 instance"
+    Value: !If [ condDeployClientTools, !Sub "https://${AWS::Region}.console.aws.amazon.com/systems-manager/session-manager/${ec2ClientHost}?region=${AWS::Region}", "n/a" ]
