@@ -105,8 +105,8 @@ Mappings:
       dbSchema: example
       dbDriver: pgsql
       dbEngine: aurora-postgresql
-      dbFamily: aurora-postgresql14
-      dbVersion: "14.6"
+      dbFamily: aurora-postgresql15
+      dbVersion: "15.3"
 
 
 ## Resources
